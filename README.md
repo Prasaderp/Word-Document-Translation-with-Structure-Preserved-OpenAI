@@ -7,7 +7,7 @@
 ### Install
 1) Open PowerShell and go to the project folder:
 ```powershell
-cd 
+cd TextTranslation
 ```
 2) Create and activate a virtual environment:
 ```powershell
