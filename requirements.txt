@@ -5,5 +5,5 @@ python-dotenv
 python-docx
 lxml
 fastapi
-uvicorn
+uvicorn[standard]
 python-multipart
