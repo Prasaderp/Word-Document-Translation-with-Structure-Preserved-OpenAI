@@ -1,0 +1,9 @@
+spacy
+# !python -m spacy download en_core_web_sm
+openai
+python-dotenv
+python-docx
+lxml
+fastapi
+uvicorn
+python-multipart
