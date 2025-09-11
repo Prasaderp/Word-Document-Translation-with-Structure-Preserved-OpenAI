@@ -18,52 +18,76 @@
   </div>
 </div>
 <main class="container">
-  <section class="grid">
-    <div class="panel">
-      <form id="form" class="form">
-        <div class="field full">
-          <label for="file">Upload Document</label>
-          <label class="dropzone" id="dropzone">
-            <input id="file" type="file" accept=".docx" required>
-            <div class="dz-body">
-              <svg class="dz-icon" xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
-              <div class="dz-title">Drop your .docx file here or click to upload</div>
-              <div class="dz-sub" id="file-name">No file selected</div>
-            </div>
-          </label>
-        </div>
-        <div class="field">
-          <label for="lang">Target language</label>
-          <select id="lang" required>
-            <option value="" disabled selected>Select a language</option>
-            <option>Hindi</option>
-            <option>Tamil</option>
-            <option>Telugu</option>
-          </select>
-        </div>
-        <div class="field">
-          <label for="terms">Terms to preserve</label>
-          <textarea id="terms" placeholder="e.g. AcmeCorp, ProjectX (comma separated)"></textarea>
-        </div>
-        <button id="start" type="submit" class="btn">Translate</button>
-      </form>
+  <div class="main-content-wrapper">
+    <div class="panel features-panel">
+      <h2 class="panel-title">Key Features</h2>
+      <ul class="features-list">
+        <li>
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feature-icon"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
+          <span><strong>Document Structure Retained:</strong> Your original formatting, including headings, paragraphs, and lists, is preserved in the translated document.</span>
+        </li>
+        <li>
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feature-icon"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
+          <span><strong>Proper Nouns Preserved:</strong> The tool automatically identifies and keeps names of people, places, and organizations untranslated.</span>
+        </li>
+        <li>
+          <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="feature-icon"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
+          <span><strong>Custom Terms:</strong> Use the "Terms to preserve" field to ensure specific brand names, technical terms, or acronyms remain in their original form.</span>
+        </li>
+      </ul>
     </div>
-    <div class="panel">
-      <div class="progress">
-        <div class="ring" id="ring">
-          <div class="ring-center">
-            <div class="percent" id="percent">0%</div>
-            <div class="time" id="time">0.0s</div>
+
+    <section class="grid">
+      <div class="panel">
+        <form id="form" class="form">
+          <div class="field full">
+            <label for="apiKey">API Key (optional)</label>
+            <input id="apiKey" type="password" placeholder="sk-...">
+          </div>
+          <div class="field full">
+            <label for="file">Upload Document</label>
+            <label class="dropzone" id="dropzone">
+              <input id="file" type="file" accept=".docx" required>
+              <div class="dz-body">
+                <svg class="dz-icon" xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+                <div class="dz-title">Drop your .docx file here or click to upload</div>
+                <div class="dz-sub" id="file-name">No file selected</div>
+              </div>
+            </label>
+          </div>
+          <div class="field">
+            <label for="lang">Target language</label>
+            <select id="lang" required>
+              <option value="" disabled selected>Select a language</option>
+              <option>Hindi</option>
+              <option>Tamil</option>
+              <option>Telugu</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="terms">Terms to preserve</label>
+            <textarea id="terms" placeholder="e.g. AcmeCorp, ProjectX (comma separated)"></textarea>
+          </div>
+          <button id="start" type="submit" class="btn">Translate</button>
+        </form>
+      </div>
+      <div class="panel">
+        <div class="progress">
+          <div class="ring" id="ring">
+            <div class="ring-center">
+              <div class="percent" id="percent">0%</div>
+              <div class="time" id="time">0.0s</div>
+            </div>
+          </div>
+          <div class="status">
+            <p class="status-label">STATUS</p>
+            <span class="chip" id="status">Idle</span>
           </div>
         </div>
-        <div class="status">
-          <p class="status-label">STATUS</p>
-          <span class="chip" id="status">Idle</span>
-        </div>
+        <a id="download" class="btn ghost" href="#" download style="display:none">Download Translated File</a>
       </div>
-      <a id="download" class="btn ghost" href="#" download style="display:none">Download Translated File</a>
-    </div>
-  </section>
+    </section>
+  </div>
 </main>
 
 <script src="/static/app.js"></script>

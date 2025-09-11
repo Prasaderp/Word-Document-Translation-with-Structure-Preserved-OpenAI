@@ -12,11 +12,13 @@ const downloadA = document.getElementById('download')
 const apiDot = document.getElementById('api-dot')
 const apiText = document.getElementById('api-text')
 const startBtn = document.getElementById('start')
+const apiKeyInput = document.getElementById('apiKey')
 startBtn.disabled = true
 
 let ws
 let wsHealth
 let lastHealth = { ok: false, present: false, age: Infinity }
+let userHealth = { ok: false, present: false, age: Infinity, checkedAt: 0, reason: 'missing' }
 let lastJobId
 
 function setProgress(p){
@@ -40,6 +42,50 @@ function setApiStatus(ok, present, age){
   startBtn.disabled = !healthy
 }
 
+function nowSeconds(){ return Date.now() / 1000 }
+function getCombinedHealth(){
+  const freshServer = lastHealth.age <= 6 && lastHealth.present && lastHealth.ok
+  const ageUser = userHealth.present ? Math.max(0, nowSeconds() - (userHealth.checkedAt || 0)) : Infinity
+  const freshUser = ageUser <= 6 && userHealth.present && userHealth.ok
+  const present = Boolean(lastHealth.present || userHealth.present)
+  const ok = Boolean(freshServer || freshUser)
+  const age = Math.min(lastHealth.age, ageUser)
+  return { ok, present, age }
+}
+function updateCombinedStatus(){
+  const c = getCombinedHealth()
+  setApiStatus(c.ok, c.present, c.age)
+}
+
+function debounce(fn, wait){
+  let t
+  return function(){
+    const ctx = this, args = arguments
+    clearTimeout(t)
+    t = setTimeout(function(){ fn.apply(ctx, args) }, wait)
+  }
+}
+
+async function validateUserKey(){
+  const key = (apiKeyInput && apiKeyInput.value || '').trim()
+  if(!key){
+    userHealth = { ok: false, present: false, age: Infinity, checkedAt: 0, reason: 'missing' }
+    updateCombinedStatus()
+    return
+  }
+  try{
+    const fd = new FormData()
+    fd.append('api_key', key)
+    const res = await fetch('/api/validate_key', { method: 'POST', body: fd })
+    const data = await res.json().catch(()=>({ ok:false, reason:'invalid' }))
+    const ok = Boolean(data && data.ok)
+    userHealth = { ok, present: true, age: 0, checkedAt: nowSeconds(), reason: data && data.reason || (ok ? 'ok' : 'invalid') }
+  }catch(e){
+    userHealth = { ok: false, present: true, age: Infinity, checkedAt: 0, reason: 'unreachable' }
+  }
+  updateCombinedStatus()
+}
+
 function startHealth(){
   startBtn.disabled = true
   setApiStatus(false, false, Infinity)
@@ -49,13 +95,18 @@ function startHealth(){
     const msg = JSON.parse(ev.data)
     if(msg.type === 'health'){
       lastHealth = { ok: Boolean(msg.openai_reachable), present: Boolean(msg.api_key_present), age: Number(msg.age_seconds || Infinity) }
-      setApiStatus(lastHealth.ok, lastHealth.present, lastHealth.age)
+      updateCombinedStatus()
     }
   }
   wsHealth.onerror = ()=>{ setApiStatus(false, false, Infinity) }
 }
 
 startHealth()
+
+if(apiKeyInput){
+  apiKeyInput.addEventListener('input', debounce(validateUserKey, 500))
+}
+setInterval(function(){ if(apiKeyInput && (apiKeyInput.value || '').trim()){ validateUserKey() } }, 10000)
 
 
 function closeWs(){
@@ -81,7 +132,8 @@ fileInput.addEventListener('change', ()=>{
 form.addEventListener('submit', async (e)=>{
   e.preventDefault()
   closeWs()
-  if(startBtn.disabled || !(lastHealth.ok && lastHealth.present && lastHealth.age <= 6)){
+  const c = getCombinedHealth()
+  if(startBtn.disabled || !(c.ok && c.present && c.age <= 6)){
     setStatus('API key is not working')
     return
   }
@@ -95,6 +147,9 @@ form.addEventListener('submit', async (e)=>{
   fd.append('file', file)
   fd.append('target_language', lang.value)
   fd.append('retain_terms', terms.value || '')
+  if(userHealth.present && userHealth.ok && (nowSeconds() - (userHealth.checkedAt||0)) <= 6){
+    fd.append('api_key', (apiKeyInput.value || '').trim())
+  }
   const res = await fetch('/api/translate', { method: 'POST', body: fd })
   if(!res.ok){ setStatus('Error starting job'); return }
   const data = await res.json()

@@ -93,15 +93,19 @@ os.makedirs(static_dir, exist_ok=True)
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 @app.post("/api/translate")
-async def start_translation(file: UploadFile = File(...), target_language: str = Form(...), retain_terms: Optional[str] = Form(None)):
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
+async def start_translation(file: UploadFile = File(...), target_language: str = Form(...), retain_terms: Optional[str] = Form(None), api_key: Optional[str] = Form(None)):
+    env_api_key = os.getenv("OPENAI_API_KEY")
+    effective_api_key = (api_key or "").strip() or env_api_key
+    if not effective_api_key:
         return JSONResponse({"error": "API key is missing"}, status_code=400)
     try:
         now = time.time()
         age = now - float(connectivity.last_checked or 0)
-        if not connectivity.last_ok or age > 6.0:
-            return JSONResponse({"error": "OpenAI API is not reachable"}, status_code=503)
+        if api_key:
+            pass
+        else:
+            if not connectivity.last_ok or age > 6.0:
+                return JSONResponse({"error": "OpenAI API is not reachable"}, status_code=503)
     except NameError:
         pass
     if not file.filename.lower().endswith(".docx"):
@@ -110,7 +114,7 @@ async def start_translation(file: UploadFile = File(...), target_language: str =
     os.makedirs(data_root, exist_ok=True)
     file_bytes = await file.read()
     job = await job_manager.create_job(data_root, file.filename, file_bytes, target_language, retain_terms)
-    asyncio.create_task(run_job(job.job_id))
+    asyncio.create_task(run_job(job.job_id, effective_api_key))
     return {"job_id": job.job_id}
 
 @app.get("/api/status/{job_id}")
@@ -155,13 +159,13 @@ async def download(job_id: str):
     filename = os.path.basename(job.output_path)
     return FileResponse(job.output_path, filename=filename, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
-async def run_job(job_id: str):
+async def run_job(job_id: str, effective_api_key: Optional[str] = None):
     job = await job_manager.get_job(job_id)
     if job is None:
         return
     job.status = "running"
     job.started_at = time.time()
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = effective_api_key or os.getenv("OPENAI_API_KEY")
     translator = EnhancedTranslator(api_key)
     try:
         async for progress, avg_quality in translator.process_enhanced_translation(job.input_path, job.output_path, job.target_language, job.retain_terms):
@@ -306,3 +310,69 @@ async def ws_health(websocket: WebSocket):
             await asyncio.sleep(5)
     except WebSocketDisconnect:
         return
+
+@app.post("/api/validate_key")
+async def validate_key(api_key: Optional[str] = Form(None)):
+    key = (api_key or "").strip()
+    if not key:
+        return JSONResponse({"ok": False, "reason": "missing"}, status_code=200)
+    try:
+        def do_req():
+            try:
+                conn = http.client.HTTPSConnection("api.openai.com", timeout=3)
+                conn.request("GET", "/v1/dashboard/billing/subscription", headers={"Authorization": f"Bearer {key}"})
+                r = conn.getresponse()
+                s = r.status
+                raw = r.read() or b""
+                conn.close()
+            except Exception:
+                return {"ok": False, "reason": "unreachable"}
+            if s != 200:
+                return {"ok": False, "reason": "invalid"}
+            try:
+                d = json.loads(raw.decode("utf-8", errors="ignore"))
+            except Exception:
+                return {"ok": False, "reason": "invalid"}
+            access_until = float(d.get("access_until", 0) or 0)
+            hard_limit_usd = float(d.get("hard_limit_usd", 0) or 0)
+            if access_until and access_until < time.time():
+                return {"ok": False, "reason": "expired"}
+            if hard_limit_usd <= 0:
+                try:
+                    conn2 = http.client.HTTPSConnection("api.openai.com", timeout=3)
+                    conn2.request("GET", "/v1/dashboard/billing/credit_grants", headers={"Authorization": f"Bearer {key}"})
+                    r2 = conn2.getresponse()
+                    s2 = r2.status
+                    raw2 = r2.read() or b""
+                    conn2.close()
+                    if s2 == 200:
+                        d2 = json.loads(raw2.decode("utf-8", errors="ignore"))
+                        ta = float(d2.get("total_available", 0) or 0)
+                        return {"ok": ta > 0, "reason": "ok" if ta > 0 else "exhausted"}
+                except Exception:
+                    return {"ok": False, "reason": "unreachable"}
+            start_date = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 30*24*3600))
+            end_date = time.strftime("%Y-%m-%d", time.gmtime())
+            try:
+                conn3 = http.client.HTTPSConnection("api.openai.com", timeout=3)
+                conn3.request("GET", f"/v1/dashboard/billing/usage?start_date={start_date}&end_date={end_date}", headers={"Authorization": f"Bearer {key}"})
+                r3 = conn3.getresponse()
+                s3 = r3.status
+                raw3 = r3.read() or b""
+                conn3.close()
+            except Exception:
+                return {"ok": False, "reason": "unreachable"}
+            if s3 != 200:
+                return {"ok": False, "reason": "invalid"}
+            try:
+                d3 = json.loads(raw3.decode("utf-8", errors="ignore"))
+                total_usage_cents = float(d3.get("total_usage", 0) or 0)
+            except Exception:
+                return {"ok": False, "reason": "invalid"}
+            return {"ok": total_usage_cents >= 0, "reason": "ok"}
+        res = await asyncio.to_thread(do_req)
+        ok = bool(res.get("ok"))
+        reason = res.get("reason") or ("ok" if ok else "invalid")
+        return {"ok": ok, "reason": reason}
+    except Exception:
+        return JSONResponse({"ok": False, "reason": "unreachable"}, status_code=200)
