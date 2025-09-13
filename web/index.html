@@ -43,6 +43,10 @@
           <div class="field full">
             <label for="apiKey">API Key (optional)</label>
             <input id="apiKey" type="password" placeholder="sk-...">
+            <div>
+              <button id="setKey" type="button" class="btn">Set</button>
+              <button id="clearKey" type="button" class="btn ghost">Clear</button>
+            </div>
           </div>
           <div class="field full">
             <label for="file">Upload Document</label>
@@ -68,7 +72,10 @@
             <label for="terms">Terms to preserve</label>
             <textarea id="terms" placeholder="e.g. AcmeCorp, ProjectX (comma separated)"></textarea>
           </div>
-          <button id="start" type="submit" class="btn">Translate</button>
+          <div>
+            <button id="start" type="submit" class="btn">Translate</button>
+            <button id="cancel" type="button" class="btn ghost" disabled>Cancel</button>
+          </div>
         </form>
       </div>
       <div class="panel">
@@ -83,8 +90,11 @@
             <p class="status-label">STATUS</p>
             <span class="chip" id="status">Idle</span>
           </div>
+          <a id="download" class="btn" href="#" download style="display: none;">
+            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+            <span>Download Translated File</span>
+          </a>
         </div>
-        <a id="download" class="btn ghost" href="#" download style="display:none">Download Translated File</a>
       </div>
     </section>
   </div>

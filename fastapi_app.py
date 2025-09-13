@@ -11,6 +11,11 @@ from translator import EnhancedTranslator
 from dotenv import load_dotenv
 import json
 import http.client
+import tempfile
+import shutil
+import hashlib
+import logging
+from logging.handlers import TimedRotatingFileHandler
 
 class Job:
     def __init__(self, job_id: str, input_path: str, output_path: str, target_language: str, retain_terms: List[str]):
@@ -27,6 +32,8 @@ class Job:
         self.completed_at: Optional[float] = None
         self.error: Optional[str] = None
         self.clients: Set[WebSocket] = set()
+        self.task: Optional[asyncio.Task] = None
+        self.temp_dir: Optional[str] = None
 
 class JobManager:
     def __init__(self):
@@ -88,33 +95,102 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-static_dir = os.path.join(os.path.dirname(__file__), "web")
+PROJECT_ROOT = os.path.dirname(__file__)
+static_dir = os.path.join(PROJECT_ROOT, "web")
 os.makedirs(static_dir, exist_ok=True)
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
+# Data and logs directories
+DATA_ROOT = os.path.join(PROJECT_ROOT, "data")
+LOGS_ROOT = os.path.join(PROJECT_ROOT, "logs")
+os.makedirs(DATA_ROOT, exist_ok=True)
+os.makedirs(LOGS_ROOT, exist_ok=True)
+
+def setup_logging():
+    try:
+        handler = TimedRotatingFileHandler(os.path.join(LOGS_ROOT, "app.log"), when="midnight", utc=True, backupCount=7)
+        formatter = logging.Formatter('%(asctime)sZ %(message)s')
+        # Use UTC for timestamps
+        logging.Formatter.converter = time.gmtime
+        handler.setFormatter(formatter)
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.INFO)
+        # Avoid duplicate handlers on reload
+        exists = any(isinstance(h, TimedRotatingFileHandler) and getattr(h, 'baseFilename', '') == handler.baseFilename for h in root_logger.handlers)
+        if not exists:
+            root_logger.addHandler(handler)
+    except Exception:
+        pass
+
+class DataCleaner:
+    def __init__(self, root_dir: str, ttl_seconds: float = 12*3600, interval_seconds: float = 1800):
+        self.root_dir = root_dir
+        self.ttl_seconds = ttl_seconds
+        self.interval_seconds = interval_seconds
+        self._task: Optional[asyncio.Task] = None
+
+    async def start(self):
+        if self._task is None:
+            self._task = asyncio.create_task(self._run())
+
+    async def _run(self):
+        while True:
+            try:
+                await self._clean_once()
+            except Exception:
+                pass
+            await asyncio.sleep(self.interval_seconds)
+
+    async def _clean_once(self):
+        try:
+            now_ts = time.time()
+            if not os.path.isdir(self.root_dir):
+                return
+            for name in os.listdir(self.root_dir):
+                path = os.path.join(self.root_dir, name)
+                try:
+                    if not os.path.isdir(path):
+                        continue
+                    # Skip active jobs
+                    active = False
+                    try:
+                        for job in list(job_manager.jobs.values()):
+                            jd = os.path.dirname(job.input_path)
+                            if os.path.abspath(jd) == os.path.abspath(path) and job.status == "running":
+                                active = True
+                                break
+                    except Exception:
+                        active = False
+                    if active:
+                        continue
+                    # Age threshold based on last modification time
+                    age = now_ts - float(os.path.getmtime(path))
+                    if age >= self.ttl_seconds:
+                        try:
+                            shutil.rmtree(path, ignore_errors=True)
+                            logging.info(f"CLEAN status=deleted dir={name} age_seconds={int(age)} at={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
+                        except Exception as e:
+                            logging.info(f"CLEAN status=error dir={name} at={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} error={str(e)}")
+                except Exception:
+                    continue
+        except Exception:
+            return
+
 @app.post("/api/translate")
 async def start_translation(file: UploadFile = File(...), target_language: str = Form(...), retain_terms: Optional[str] = Form(None), api_key: Optional[str] = Form(None)):
-    env_api_key = os.getenv("OPENAI_API_KEY")
-    effective_api_key = (api_key or "").strip() or env_api_key
+    effective_api_key = (api_key or "").strip()
     if not effective_api_key:
         return JSONResponse({"error": "API key is missing"}, status_code=400)
-    try:
-        now = time.time()
-        age = now - float(connectivity.last_checked or 0)
-        if api_key:
-            pass
-        else:
-            if not connectivity.last_ok or age > 6.0:
-                return JSONResponse({"error": "OpenAI API is not reachable"}, status_code=503)
-    except NameError:
-        pass
     if not file.filename.lower().endswith(".docx"):
         return JSONResponse({"error": "Only .docx files are supported"}, status_code=400)
-    data_root = os.path.join(os.path.dirname(__file__), "data")
+    data_root = os.path.join(DATA_ROOT, str(uuid.uuid4()))
     os.makedirs(data_root, exist_ok=True)
     file_bytes = await file.read()
     job = await job_manager.create_job(data_root, file.filename, file_bytes, target_language, retain_terms)
-    asyncio.create_task(run_job(job.job_id, effective_api_key))
+    job.temp_dir = os.path.dirname(job.input_path)
+    logging.info(f"JOB status=created id={job.job_id} file={os.path.basename(job.input_path)} at={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
+    task = asyncio.create_task(run_job(job.job_id, effective_api_key))
+    job.task = task
     return {"job_id": job.job_id}
 
 @app.get("/api/status/{job_id}")
@@ -159,13 +235,40 @@ async def download(job_id: str):
     filename = os.path.basename(job.output_path)
     return FileResponse(job.output_path, filename=filename, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
+@app.post("/api/cancel/{job_id}")
+async def cancel(job_id: str):
+    job = await job_manager.get_job(job_id)
+    if job is None:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    if job.status in ("completed", "error", "cancelled"):
+        return {"ok": True, "status": job.status}
+    job.status = "cancelled"
+    job.completed_at = time.time()
+    try:
+        if job.task:
+            job.task.cancel()
+    except Exception:
+        pass
+    try:
+        await job_manager.broadcast(job, {"type": "cancelled", "progress": float(job.progress), "avg_quality": round(job.avg_quality, 2)})
+    except Exception:
+        pass
+    try:
+        if job.temp_dir and os.path.isdir(job.temp_dir):
+            shutil.rmtree(job.temp_dir, ignore_errors=True)
+            job.temp_dir = None
+    except Exception:
+        pass
+    logging.info(f"JOB status=cancelled id={job.job_id} file={os.path.basename(job.input_path)} at={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
+    return {"ok": True, "status": "cancelled"}
+
 async def run_job(job_id: str, effective_api_key: Optional[str] = None):
     job = await job_manager.get_job(job_id)
     if job is None:
         return
     job.status = "running"
     job.started_at = time.time()
-    api_key = effective_api_key or os.getenv("OPENAI_API_KEY")
+    api_key = effective_api_key
     translator = EnhancedTranslator(api_key)
     try:
         async for progress, avg_quality in translator.process_enhanced_translation(job.input_path, job.output_path, job.target_language, job.retain_terms):
@@ -177,134 +280,47 @@ async def run_job(job_id: str, effective_api_key: Optional[str] = None):
         job.completed_at = time.time()
         elapsed = max(0.0, job.completed_at - (job.started_at or job.completed_at))
         await job_manager.broadcast(job, {"type": "completed", "progress": 100.0, "avg_quality": round(job.avg_quality, 2), "elapsed_seconds": round(elapsed, 1), "download_url": f"/api/download/{job.job_id}"})
+        logging.info(f"JOB status=completed id={job.job_id} file={os.path.basename(job.input_path)} at={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
     except Exception as e:
-        job.status = "error"
-        job.error = str(e)
-        await job_manager.broadcast(job, {"type": "error", "message": job.error})
+        if isinstance(e, asyncio.CancelledError):
+            job.status = "cancelled"
+            job.error = None
+            logging.info(f"JOB status=cancelled id={job.job_id} file={os.path.basename(job.input_path)} at={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
+        else:
+            job.status = "error"
+            job.error = str(e)
+            await job_manager.broadcast(job, {"type": "error", "message": job.error})
+            logging.info(f"JOB status=error id={job.job_id} file={os.path.basename(job.input_path)} at={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} error={job.error}")
+        try:
+            if job.temp_dir and os.path.isdir(job.temp_dir):
+                shutil.rmtree(job.temp_dir, ignore_errors=True)
+                job.temp_dir = None
+        except Exception:
+            pass
 
 @app.get("/")
 async def root_index():
     return FileResponse(os.path.join(static_dir, "index.html"))
 
-class OpenAIConnectivityMonitor:
-    def __init__(self):
-        self.last_ok = False
-        self.last_checked = 0.0
-        self.interval_seconds = 5.0
-        self._task: Optional[asyncio.Task] = None
-        self.last_reason = "unknown"
-
-    async def start(self):
-        if self._task is None:
-            self._task = asyncio.create_task(self._run())
-
-    async def _run(self):
-        while True:
-            try:
-                await self._check_once()
-            except Exception:
-                self.last_ok = False
-                self.last_checked = time.time()
-            await asyncio.sleep(self.interval_seconds)
-
-    async def _check_once(self):
-        api_key = os.getenv("OPENAI_API_KEY")
-        ok = False
-        reason = "missing_key" if not api_key else "unreachable"
-        if api_key:
-            def do_req():
-                try:
-                    conn = http.client.HTTPSConnection("api.openai.com", timeout=3)
-                    conn.request("GET", "/v1/dashboard/billing/subscription", headers={"Authorization": f"Bearer {api_key}"})
-                    r1 = conn.getresponse()
-                    s1 = r1.status
-                    raw1 = r1.read() or b""
-                    conn.close()
-                except Exception:
-                    return {"ok": False, "reason": "unreachable"}
-                if s1 != 200:
-                    return {"ok": False, "reason": "unreachable"}
-                try:
-                    d1 = json.loads(raw1.decode("utf-8", errors="ignore"))
-                except Exception:
-                    return {"ok": False, "reason": "unreachable"}
-                access_until = float(d1.get("access_until", 0) or 0)
-                hard_limit_usd = float(d1.get("hard_limit_usd", 0) or 0)
-                if access_until and access_until < time.time():
-                    return {"ok": False, "reason": "expired"}
-                if hard_limit_usd <= 0:
-                    try:
-                        conn2 = http.client.HTTPSConnection("api.openai.com", timeout=3)
-                        conn2.request("GET", "/v1/dashboard/billing/credit_grants", headers={"Authorization": f"Bearer {api_key}"})
-                        r2 = conn2.getresponse()
-                        s2 = r2.status
-                        raw2 = r2.read() or b""
-                        conn2.close()
-                        if s2 == 200:
-                            d2 = json.loads(raw2.decode("utf-8", errors="ignore"))
-                            ta = float(d2.get("total_available", 0) or 0)
-                            return {"ok": ta > 0, "reason": "ok" if ta > 0 else "exhausted"}
-                    except Exception:
-                        return {"ok": False, "reason": "unreachable"}
-                start_date = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 30*24*3600))
-                end_date = time.strftime("%Y-%m-%d", time.gmtime())
-                try:
-                    conn3 = http.client.HTTPSConnection("api.openai.com", timeout=3)
-                    conn3.request("GET", f"/v1/dashboard/billing/usage?start_date={start_date}&end_date={end_date}", headers={"Authorization": f"Bearer {api_key}"})
-                    r3 = conn3.getresponse()
-                    s3 = r3.status
-                    raw3 = r3.read() or b""
-                    conn3.close()
-                except Exception:
-                    return {"ok": False, "reason": "unreachable"}
-                if s3 != 200:
-                    return {"ok": False, "reason": "unreachable"}
-                try:
-                    d3 = json.loads(raw3.decode("utf-8", errors="ignore"))
-                    total_usage_cents = float(d3.get("total_usage", 0) or 0)
-                except Exception:
-                    return {"ok": False, "reason": "unreachable"}
-                limit_cents = hard_limit_usd * 100
-                if limit_cents <= 0:
-                    return {"ok": False, "reason": "exhausted"}
-                if total_usage_cents >= limit_cents:
-                    return {"ok": False, "reason": "exhausted"}
-                return {"ok": True, "reason": "ok"}
-            try:
-                res = await asyncio.to_thread(do_req)
-                ok = bool(res.get("ok"))
-                reason = res.get("reason") or ("ok" if ok else "unreachable")
-            except Exception:
-                ok = False
-                reason = "unreachable"
-        self.last_ok = bool(ok and api_key)
-        self.last_reason = reason
-        self.last_checked = time.time()
-
-connectivity = OpenAIConnectivityMonitor()
-
 @app.on_event("startup")
 async def on_start():
-    try:
-        await connectivity._check_once()
-    finally:
-        await connectivity.start()
+    setup_logging()
+    cleaner = DataCleaner(DATA_ROOT)
+    await cleaner.start()
 
 @app.websocket("/ws/health")
 async def ws_health(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
-            api_key_present = bool(os.getenv("OPENAI_API_KEY"))
             now = time.time()
-            age_seconds = max(0.0, now - float(connectivity.last_checked or 0))
             payload = {
                 "type": "health",
-                "api_key_present": api_key_present,
-                "openai_reachable": bool(connectivity.last_ok),
-                "checked_at": connectivity.last_checked,
-                "age_seconds": round(age_seconds, 3),
-                "reason": connectivity.last_reason
+                "api_key_present": False,
+                "openai_reachable": False,
+                "checked_at": now,
+                "age_seconds": 0.0,
+                "reason": "client_key_only"
             }
             await websocket.send_json(payload)
             await asyncio.sleep(5)
@@ -316,63 +332,51 @@ async def validate_key(api_key: Optional[str] = Form(None)):
     key = (api_key or "").strip()
     if not key:
         return JSONResponse({"ok": False, "reason": "missing"}, status_code=200)
+    # Simple in-memory cache to avoid hammering OpenAI on frequent validations
+    # Cache by hash for privacy
+    global _key_cache
+    try:
+        _key_cache
+    except NameError:
+        _key_cache = {}
+    now_ts = time.time()
+    key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    cached = _key_cache.get(key_hash)
+    if cached:
+        last_ts, last_res = cached
+        # Minimum interval between upstream checks
+        if (now_ts - last_ts) < 15:
+            return {"ok": bool(last_res.get("ok")), "reason": last_res.get("reason") or ("ok" if last_res.get("ok") else "invalid")}
+        # Respect TTLs: 5 minutes for success, 30s for failure
+        if (last_res.get("ok") and (now_ts - last_ts) < 300) or ((not last_res.get("ok")) and (now_ts - last_ts) < 30):
+            return {"ok": bool(last_res.get("ok")), "reason": last_res.get("reason") or ("ok" if last_res.get("ok") else "invalid")}
     try:
         def do_req():
             try:
+                # Use a lightweight endpoint that verifies key validity without billing-specific scopes
                 conn = http.client.HTTPSConnection("api.openai.com", timeout=3)
-                conn.request("GET", "/v1/dashboard/billing/subscription", headers={"Authorization": f"Bearer {key}"})
+                conn.request("GET", "/v1/models", headers={"Authorization": f"Bearer {key}"})
                 r = conn.getresponse()
                 s = r.status
                 raw = r.read() or b""
                 conn.close()
             except Exception:
                 return {"ok": False, "reason": "unreachable"}
-            if s != 200:
+            # Interpret common statuses conservatively
+            if s == 200:
+                return {"ok": True, "reason": "ok"}
+            if s == 429:
+                # Key is valid but currently rate limited
+                return {"ok": True, "reason": "ok"}
+            if s in (401, 403):
                 return {"ok": False, "reason": "invalid"}
-            try:
-                d = json.loads(raw.decode("utf-8", errors="ignore"))
-            except Exception:
-                return {"ok": False, "reason": "invalid"}
-            access_until = float(d.get("access_until", 0) or 0)
-            hard_limit_usd = float(d.get("hard_limit_usd", 0) or 0)
-            if access_until and access_until < time.time():
-                return {"ok": False, "reason": "expired"}
-            if hard_limit_usd <= 0:
-                try:
-                    conn2 = http.client.HTTPSConnection("api.openai.com", timeout=3)
-                    conn2.request("GET", "/v1/dashboard/billing/credit_grants", headers={"Authorization": f"Bearer {key}"})
-                    r2 = conn2.getresponse()
-                    s2 = r2.status
-                    raw2 = r2.read() or b""
-                    conn2.close()
-                    if s2 == 200:
-                        d2 = json.loads(raw2.decode("utf-8", errors="ignore"))
-                        ta = float(d2.get("total_available", 0) or 0)
-                        return {"ok": ta > 0, "reason": "ok" if ta > 0 else "exhausted"}
-                except Exception:
-                    return {"ok": False, "reason": "unreachable"}
-            start_date = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 30*24*3600))
-            end_date = time.strftime("%Y-%m-%d", time.gmtime())
-            try:
-                conn3 = http.client.HTTPSConnection("api.openai.com", timeout=3)
-                conn3.request("GET", f"/v1/dashboard/billing/usage?start_date={start_date}&end_date={end_date}", headers={"Authorization": f"Bearer {key}"})
-                r3 = conn3.getresponse()
-                s3 = r3.status
-                raw3 = r3.read() or b""
-                conn3.close()
-            except Exception:
-                return {"ok": False, "reason": "unreachable"}
-            if s3 != 200:
-                return {"ok": False, "reason": "invalid"}
-            try:
-                d3 = json.loads(raw3.decode("utf-8", errors="ignore"))
-                total_usage_cents = float(d3.get("total_usage", 0) or 0)
-            except Exception:
-                return {"ok": False, "reason": "invalid"}
-            return {"ok": total_usage_cents >= 0, "reason": "ok"}
+            # Other statuses treated as temporary/unreachable
+            return {"ok": False, "reason": "unreachable"}
         res = await asyncio.to_thread(do_req)
         ok = bool(res.get("ok"))
         reason = res.get("reason") or ("ok" if ok else "invalid")
+        # Update cache
+        _key_cache[key_hash] = (now_ts, {"ok": ok, "reason": reason})
         return {"ok": ok, "reason": reason}
     except Exception:
         return JSONResponse({"ok": False, "reason": "unreachable"}, status_code=200)

@@ -13,6 +13,9 @@ const apiDot = document.getElementById('api-dot')
 const apiText = document.getElementById('api-text')
 const startBtn = document.getElementById('start')
 const apiKeyInput = document.getElementById('apiKey')
+const setKeyBtn = document.getElementById('setKey')
+const clearKeyBtn = document.getElementById('clearKey')
+const cancelBtn = document.getElementById('cancel')
 startBtn.disabled = true
 
 let ws
@@ -20,6 +23,8 @@ let wsHealth
 let lastHealth = { ok: false, present: false, age: Infinity }
 let userHealth = { ok: false, present: false, age: Infinity, checkedAt: 0, reason: 'missing' }
 let lastJobId
+let userHealthIntervalId
+const FRESH_WINDOW_SECONDS = 300
 
 function setProgress(p){
   const clamped = Math.max(0, Math.min(100, p))
@@ -35,7 +40,7 @@ function setStatus(t){
   statusEl.textContent = t
 }
 function setApiStatus(ok, present, age){
-  const fresh = age <= 6
+  const fresh = age <= FRESH_WINDOW_SECONDS
   const healthy = ok && present && fresh
   apiDot.style.background = healthy ? '#12b76a' : present ? '#f59e0b' : '#ef4444'
   apiText.textContent = present ? (healthy ? 'API OK' : 'API not working') : 'API key missing'
@@ -44,9 +49,9 @@ function setApiStatus(ok, present, age){
 
 function nowSeconds(){ return Date.now() / 1000 }
 function getCombinedHealth(){
-  const freshServer = lastHealth.age <= 6 && lastHealth.present && lastHealth.ok
+  const freshServer = lastHealth.age <= FRESH_WINDOW_SECONDS && lastHealth.present && lastHealth.ok
   const ageUser = userHealth.present ? Math.max(0, nowSeconds() - (userHealth.checkedAt || 0)) : Infinity
-  const freshUser = ageUser <= 6 && userHealth.present && userHealth.ok
+  const freshUser = ageUser <= FRESH_WINDOW_SECONDS && userHealth.present && userHealth.ok
   const present = Boolean(lastHealth.present || userHealth.present)
   const ok = Boolean(freshServer || freshUser)
   const age = Math.min(lastHealth.age, ageUser)
@@ -66,24 +71,96 @@ function debounce(fn, wait){
   }
 }
 
-async function validateUserKey(){
-  const key = (apiKeyInput && apiKeyInput.value || '').trim()
-  if(!key){
-    userHealth = { ok: false, present: false, age: Infinity, checkedAt: 0, reason: 'missing' }
-    updateCombinedStatus()
-    return
-  }
+function reasonToMessage(r){
+  if(r === 'ok') return 'API key saved'
+  if(r === 'invalid') return 'API key invalid'
+  if(r === 'expired') return 'API key expired'
+  if(r === 'exhausted') return 'API quota exhausted'
+  if(r === 'unreachable') return 'OpenAI API unreachable'
+  if(r === 'missing') return 'API key missing'
+  return 'API key error'
+}
+
+async function doValidateKey(key){
+  const trimmed = (key || '').trim()
+  if(!trimmed){ return { ok:false, reason:'missing' } }
   try{
     const fd = new FormData()
-    fd.append('api_key', key)
+    fd.append('api_key', trimmed)
     const res = await fetch('/api/validate_key', { method: 'POST', body: fd })
     const data = await res.json().catch(()=>({ ok:false, reason:'invalid' }))
     const ok = Boolean(data && data.ok)
-    userHealth = { ok, present: true, age: 0, checkedAt: nowSeconds(), reason: data && data.reason || (ok ? 'ok' : 'invalid') }
+    return { ok, reason: (data && data.reason) || (ok ? 'ok' : 'invalid') }
   }catch(e){
-    userHealth = { ok: false, present: true, age: Infinity, checkedAt: 0, reason: 'unreachable' }
+    return { ok:false, reason:'unreachable' }
+  }
+}
+
+function stopUserHealthLoop(){
+  if(userHealthIntervalId){
+    clearTimeout(userHealthIntervalId)
+    userHealthIntervalId = undefined
+  }
+}
+
+function startUserHealthLoop(){
+  stopUserHealthLoop()
+  let nextDelaySec = 15
+  async function tick(){
+    const stored = getCookie('user_api_key') || ''
+    if(!stored){ stopUserHealthLoop(); return }
+    const res = await doValidateKey(stored)
+    const ok = Boolean(res.ok)
+    userHealth = { ok, present: true, age: 0, checkedAt: nowSeconds(), reason: res.reason || (ok ? 'ok' : 'invalid') }
+    updateCombinedStatus()
+    if(ok){
+      // Slow down checks when healthy; between 60s and 300s
+      nextDelaySec = Math.min(300, Math.max(60, nextDelaySec * 2))
+    }else{
+      // Retry faster on failure; between 15s and 120s
+      nextDelaySec = Math.min(120, Math.max(15, Math.floor(nextDelaySec * 1.5)))
+    }
+    userHealthIntervalId = setTimeout(tick, nextDelaySec * 1000)
+  }
+  // Start immediately, then backoff
+  tick()
+}
+
+async function applyApiKey(key, opts){
+  const options = opts || { silent: false }
+  const res = await doValidateKey(key)
+  if(res.ok){
+    setCookie('user_api_key', (key || '').trim(), 30)
+    userHealth = { ok: true, present: true, age: 0, checkedAt: nowSeconds(), reason: 'ok' }
+    startUserHealthLoop()
+    if(!options.silent){ setStatus('API key saved') }
+  }else{
+    userHealth = { ok: false, present: true, age: Infinity, checkedAt: 0, reason: res.reason }
+    stopUserHealthLoop()
+    if(!options.silent){ setStatus(reasonToMessage(res.reason)) }
   }
   updateCombinedStatus()
+}
+
+function setCookie(name, value, days){
+  const d = new Date()
+  d.setTime(d.getTime() + (days*24*60*60*1000))
+  const expires = 'expires=' + d.toUTCString()
+  const secure = location.protocol === 'https:' ? '; Secure' : ''
+  document.cookie = name + '=' + encodeURIComponent(value) + ';' + expires + '; path=/; SameSite=Strict' + secure
+}
+function getCookie(name){
+  const n = name + '='
+  const ca = document.cookie.split(';')
+  for(let i=0;i<ca.length;i++){
+    let c = ca[i]
+    while(c.charAt(0) === ' '){ c = c.substring(1) }
+    if(c.indexOf(n) === 0){ return decodeURIComponent(c.substring(n.length, c.length)) }
+  }
+  return ''
+}
+function deleteCookie(name){
+  document.cookie = name + '=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; SameSite=Strict'
 }
 
 function startHealth(){
@@ -104,9 +181,46 @@ function startHealth(){
 startHealth()
 
 if(apiKeyInput){
-  apiKeyInput.addEventListener('input', debounce(validateUserKey, 500))
+  apiKeyInput.addEventListener('input', function(){
+    // Mark as changed; require explicit Set
+    stopUserHealthLoop()
+    userHealth = { ok: false, present: false, age: Infinity, checkedAt: 0, reason: 'missing' }
+    updateCombinedStatus()
+  })
 }
-setInterval(function(){ if(apiKeyInput && (apiKeyInput.value || '').trim()){ validateUserKey() } }, 10000)
+
+if(setKeyBtn){
+  setKeyBtn.addEventListener('click', async function(){
+    const key = (apiKeyInput && apiKeyInput.value || '').trim()
+    if(!key){
+      userHealth = { ok: false, present: false, age: Infinity, checkedAt: 0, reason: 'missing' }
+      updateCombinedStatus()
+      setStatus('API key missing')
+      return
+    }
+    setKeyBtn.disabled = true
+    try{ await applyApiKey(key, { silent: false }) } finally { setKeyBtn.disabled = false }
+  })
+}
+
+if(clearKeyBtn){
+  clearKeyBtn.addEventListener('click', function(){
+    stopUserHealthLoop()
+    deleteCookie('user_api_key')
+    if(apiKeyInput){ apiKeyInput.value = '' }
+    userHealth = { ok: false, present: false, age: Infinity, checkedAt: 0, reason: 'missing' }
+    updateCombinedStatus()
+    setStatus('API key cleared')
+  })
+}
+
+// Load persisted key on startup
+;(function(){
+  const legacy = (typeof localStorage !== 'undefined') ? (localStorage.getItem('user_api_key') || '') : ''
+  if(legacy){ setCookie('user_api_key', legacy, 30); try{ localStorage.removeItem('user_api_key') }catch(_){} }
+  const stored = getCookie('user_api_key')
+  if(stored && apiKeyInput){ apiKeyInput.value = stored; applyApiKey(stored, { silent: true }) }
+})()
 
 
 function closeWs(){
@@ -133,7 +247,7 @@ form.addEventListener('submit', async (e)=>{
   e.preventDefault()
   closeWs()
   const c = getCombinedHealth()
-  if(startBtn.disabled || !(c.ok && c.present && c.age <= 6)){
+  if(startBtn.disabled || !(c.ok && c.present && c.age <= FRESH_WINDOW_SECONDS)){
     setStatus('API key is not working')
     return
   }
@@ -147,14 +261,14 @@ form.addEventListener('submit', async (e)=>{
   fd.append('file', file)
   fd.append('target_language', lang.value)
   fd.append('retain_terms', terms.value || '')
-  if(userHealth.present && userHealth.ok && (nowSeconds() - (userHealth.checkedAt||0)) <= 6){
-    fd.append('api_key', (apiKeyInput.value || '').trim())
-  }
+  const cookieKey = getCookie('user_api_key')
+  if(cookieKey && userHealth.present && userHealth.ok && (nowSeconds() - (userHealth.checkedAt||0)) <= FRESH_WINDOW_SECONDS){ fd.append('api_key', cookieKey) }
   const res = await fetch('/api/translate', { method: 'POST', body: fd })
   if(!res.ok){ setStatus('Error starting job'); return }
   const data = await res.json()
   lastJobId = data.job_id
   setStatus('Processing')
+  if(cancelBtn){ cancelBtn.disabled = false }
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
   ws = new WebSocket(`${proto}://${location.host}/ws/progress/${lastJobId}`)
   ws.onmessage = (ev)=>{
@@ -172,11 +286,28 @@ form.addEventListener('submit', async (e)=>{
         downloadA.style.display = 'inline-block'
       }
       closeWs()
+      if(cancelBtn){ cancelBtn.disabled = true }
     } else if(msg.type === 'error'){
       setStatus('Error')
       closeWs()
+      if(cancelBtn){ cancelBtn.disabled = true }
+    } else if(msg.type === 'cancelled'){
+      setStatus('Cancelled')
+      closeWs()
+      if(cancelBtn){ cancelBtn.disabled = true }
+      downloadA.style.display = 'none'
     }
   }
   ws.onerror = ()=>{ setStatus('Connection error') }
 })
+
+if(cancelBtn){
+  cancelBtn.addEventListener('click', async function(){
+    if(!lastJobId){ return }
+    try{
+      const res = await fetch(`/api/cancel/${lastJobId}`, { method: 'POST' })
+      if(res.ok){ setStatus('Cancelled'); if(cancelBtn){ cancelBtn.disabled = true }; downloadA.style.display = 'none'; closeWs() }
+    }catch(e){ setStatus('Cancel failed') }
+  })
+}
 

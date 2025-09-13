@@ -151,7 +151,7 @@ class EnhancedTranslator:
                 
                 message = [{"role": "system", "content": system_prompt}, {"role": "user", "content": masked_text}]
                 response = await self.client.chat.completions.create(
-                    model="gpt-4o", messages=message,
+                    model="gpt-4o-mini", messages=message,
                     temperature=0.1 if attempt > 0 else 0, max_tokens=4000
                 )
                 translated_text = self._unmask_text(response.choices[0].message.content.strip(), token_map)

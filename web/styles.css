@@ -140,7 +140,6 @@ textarea { min-height: 108px; resize: vertical; }
 .btn.ghost {
   background-color: transparent; color: var(--accent-primary);
   border: 1px solid var(--accent-primary);
-  width: 100%; margin-top: 24px;
 }
 .btn.ghost:hover { background-color: var(--accent-primary-light); }
 
